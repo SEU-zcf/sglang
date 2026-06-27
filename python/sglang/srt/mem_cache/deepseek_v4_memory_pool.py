@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16P
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
@@ -1087,3 +1088,316 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+
+    @staticmethod
+    def _chunk_copy_rows_to_cpu(
+        buf: torch.Tensor,
+        row_indices: torch.Tensor,
+        chunk_rows: int,
+    ) -> List[torch.Tensor]:
+        return [
+            buf[row_indices[i : i + chunk_rows]].to("cpu", non_blocking=True)
+            for i in range(0, row_indices.numel(), chunk_rows)
+        ]
+
+    @classmethod
+    def _chunk_copy_buffers_to_cpu(
+        cls,
+        buffers: List[torch.Tensor],
+        row_indices: torch.Tensor,
+        chunk_rows: int,
+    ) -> List[List[torch.Tensor]]:
+        return [
+            cls._chunk_copy_rows_to_cpu(buf, row_indices, chunk_rows) for buf in buffers
+        ]
+
+    @staticmethod
+    def _write_chunked_rows(
+        buf: torch.Tensor,
+        row_indices: torch.Tensor,
+        chunks_cpu: List[torch.Tensor],
+        chunk_rows: int,
+    ) -> None:
+        copied_rows = sum(chunk.shape[0] for chunk in chunks_cpu)
+        assert copied_rows == row_indices.numel(), (
+            f"CPU copy has {copied_rows} rows, but the target has "
+            f"{row_indices.numel()} rows"
+        )
+        for chunk_id, cpu_chunk in enumerate(chunks_cpu):
+            start = chunk_id * chunk_rows
+            target = row_indices[start : start + cpu_chunk.shape[0]]
+            assert cpu_chunk.shape[0] == target.numel(), (
+                f"CPU chunk has {cpu_chunk.shape[0]} rows, but the target has "
+                f"{target.numel()} rows"
+            )
+            buf[target] = cpu_chunk.to(buf.device, non_blocking=True)
+
+    @classmethod
+    def _write_chunked_buffers(
+        cls,
+        buffers: List[torch.Tensor],
+        row_indices: torch.Tensor,
+        chunks_cpu: List[List[torch.Tensor]],
+        chunk_rows: int,
+    ) -> None:
+        assert len(buffers) == len(chunks_cpu)
+        for buf, layer_chunks in zip(buffers, chunks_cpu):
+            cls._write_chunked_rows(buf, row_indices, layer_chunks, chunk_rows)
+
+    @staticmethod
+    def _state_locs_from_swa(
+        pool: CompressStatePool, swa_locs: torch.Tensor
+    ) -> torch.Tensor:
+        if _is_hip:
+            # The HIP compressor keeps one row per ring slot. The CUDA path
+            # stores one row per compression group instead.
+            return pool.translate_from_swa_loc_to_state_loc(swa_locs).to(torch.int64)
+
+        swa_pages = swa_locs // pool.swa_page_size
+        raw_locs = swa_pages * pool.ring_size + swa_locs % pool.ring_size
+        return (raw_locs // pool.ratio).to(torch.int64)
+
+    def _compute_offload_indices(
+        self,
+        indices: torch.Tensor,
+        c4_page_override: Optional[torch.Tensor] = None,
+    ) -> dict:
+        swa_locs = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
+        swa_mask = swa_locs > 0
+        mapped_swa_locs = swa_locs[swa_mask]
+        swa_page_indices = torch.unique_consecutive(
+            mapped_swa_locs // self.swa_page_size
+        )
+        full_page_indices = torch.unique_consecutive(indices // self.page_size)
+
+        if c4_page_override is not None:
+            assert (
+                c4_page_override.numel() == full_page_indices.numel()
+            ), "HiSparse c4 page count must match the number of logical full pages"
+            c4_page_indices = c4_page_override
+        else:
+            c4_page_indices = full_page_indices
+
+        return {
+            "swa_mask": swa_mask,
+            "mapped_swa_locs": mapped_swa_locs,
+            "swa_page_indices": swa_page_indices,
+            "full_page_indices": full_page_indices,
+            "c4_page_indices": c4_page_indices,
+        }
+
+    def _check_cpu_offload_supported(self) -> None:
+        if self._unified_kv:
+            raise NotImplementedError(
+                "DeepSeek V4 CPU retract offload does not support unified_kv yet: "
+                "the unified SWA ring is addressed by request-pool slot, which is "
+                "not part of the get_cpu_copy/load_cpu_copy API"
+            )
+        if current_platform.is_npu():
+            raise NotImplementedError(
+                "DeepSeek V4 CPU retract offload does not support the NPU paged "
+                "compress-state layout yet"
+            )
+
+    def get_cpu_copy(
+        self,
+        indices: torch.Tensor,
+        mamba_indices=None,
+        _c4_page_override: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Copy every non-unified DSV4 KV sub-pool needed to resume a request."""
+        assert mamba_indices is None, "DeepSeek V4 has no mamba state"
+        self._check_cpu_offload_supported()
+
+        offload_indices = self._compute_offload_indices(
+            indices, c4_page_override=_c4_page_override
+        )
+        swa_page_indices = offload_indices["swa_page_indices"]
+        full_page_indices = offload_indices["full_page_indices"]
+        c4_page_indices = offload_indices["c4_page_indices"]
+        mapped_swa_locs = offload_indices["mapped_swa_locs"]
+
+        swa_chunk_pages = max(
+            1, self.swa_kv_pool.cpu_offloading_chunk_size // self.swa_page_size
+        )
+        c4_chunk_pages = max(
+            1,
+            self.c4_kv_pool.cpu_offloading_chunk_size // self.c4_kv_pool.page_size,
+        )
+        c128_chunk_pages = max(
+            1,
+            self.c128_kv_pool.cpu_offloading_chunk_size // self.c128_kv_pool.page_size,
+        )
+        indexer_chunk_pages = max(
+            1,
+            self.c4_indexer_kv_pool.cpu_offloading_chunk_size
+            // self.c4_indexer_kv_pool.page_size,
+        )
+
+        current_platform.synchronize()
+        swa_cpu = self._chunk_copy_buffers_to_cpu(
+            self.swa_kv_pool.kv_buffer, swa_page_indices, swa_chunk_pages
+        )
+        c4_cpu = self._chunk_copy_buffers_to_cpu(
+            self.c4_kv_pool.kv_buffer, c4_page_indices, c4_chunk_pages
+        )
+        c128_cpu = self._chunk_copy_buffers_to_cpu(
+            self.c128_kv_pool.kv_buffer, full_page_indices, c128_chunk_pages
+        )
+        indexer_cpu = self._chunk_copy_buffers_to_cpu(
+            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            full_page_indices,
+            indexer_chunk_pages,
+        )
+
+        state_chunk_rows = self.cpu_offloading_chunk_size
+        compress_state_cpu: List[Optional[List[torch.Tensor]]] = [None] * len(
+            self.compress_state_pools
+        )
+        for layer_id, pool in enumerate(self.compress_state_pools):
+            if pool is not None:
+                state_locs = self._state_locs_from_swa(pool, mapped_swa_locs)
+                compress_state_cpu[layer_id] = self._chunk_copy_rows_to_cpu(
+                    pool.kv_score_buffer.kv_score,
+                    state_locs,
+                    state_chunk_rows,
+                )
+
+        indexer_state_cpu: List[Optional[List[torch.Tensor]]] = [None] * len(
+            self.indexer_compress_state_pools
+        )
+        for layer_id, pool in enumerate(self.indexer_compress_state_pools):
+            if pool is not None:
+                state_locs = self._state_locs_from_swa(pool, mapped_swa_locs)
+                indexer_state_cpu[layer_id] = self._chunk_copy_rows_to_cpu(
+                    pool.kv_score_buffer.kv_score,
+                    state_locs,
+                    state_chunk_rows,
+                )
+        current_platform.synchronize()
+
+        return {
+            "meta": {
+                "page_size": self.page_size,
+                "swa_page_size": self.swa_page_size,
+                "num_full_tokens": indices.numel(),
+                "stage_start": self._stage_start,
+                "stage_end": self._stage_end,
+                "compression_ratios": list(self.compression_ratios),
+            },
+            "swa": swa_cpu,
+            "c4": c4_cpu,
+            "c128": c128_cpu,
+            "c4_indexer": indexer_cpu,
+            "compress_state": compress_state_cpu,
+            "indexer_compress_state": indexer_state_cpu,
+            "swa_mask": offload_indices["swa_mask"].cpu(),
+        }
+
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu: dict,
+        indices: torch.Tensor,
+        mamba_indices=None,
+        _c4_page_override: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Restore a DSV4 CPU copy into newly allocated device slots."""
+        assert mamba_indices is None, "DeepSeek V4 has no mamba state"
+        self._check_cpu_offload_supported()
+
+        meta = kv_cache_cpu["meta"]
+        assert meta["page_size"] == self.page_size
+        assert meta["swa_page_size"] == self.swa_page_size
+        assert meta["num_full_tokens"] == indices.numel()
+        assert meta["stage_start"] == self._stage_start
+        assert meta["stage_end"] == self._stage_end
+        assert meta["compression_ratios"] == self.compression_ratios
+
+        full_page_indices = torch.unique_consecutive(indices // self.page_size)
+        if _c4_page_override is not None:
+            assert _c4_page_override.numel() == full_page_indices.numel()
+            c4_page_indices = _c4_page_override
+        else:
+            c4_page_indices = full_page_indices
+
+        saved_swa_mask = kv_cache_cpu["swa_mask"].to(indices.device, non_blocking=True)
+        assert saved_swa_mask.numel() == indices.numel()
+        mapped_full_indices = indices[saved_swa_mask]
+        mapped_swa_locs = self.translate_loc_from_full_to_swa(mapped_full_indices).to(
+            torch.int64
+        )
+        if mapped_swa_locs.numel() > 0:
+            assert bool(torch.all(mapped_swa_locs > 0).item()), (
+                "The resumed DSV4 SWA allocation does not cover every token that "
+                "had SWA state when it was offloaded"
+            )
+        swa_page_indices = torch.unique_consecutive(
+            mapped_swa_locs // self.swa_page_size
+        )
+
+        swa_chunk_pages = max(
+            1, self.swa_kv_pool.cpu_offloading_chunk_size // self.swa_page_size
+        )
+        c4_chunk_pages = max(
+            1,
+            self.c4_kv_pool.cpu_offloading_chunk_size // self.c4_kv_pool.page_size,
+        )
+        c128_chunk_pages = max(
+            1,
+            self.c128_kv_pool.cpu_offloading_chunk_size // self.c128_kv_pool.page_size,
+        )
+        indexer_chunk_pages = max(
+            1,
+            self.c4_indexer_kv_pool.cpu_offloading_chunk_size
+            // self.c4_indexer_kv_pool.page_size,
+        )
+
+        current_platform.synchronize()
+        self._write_chunked_buffers(
+            self.swa_kv_pool.kv_buffer,
+            swa_page_indices,
+            kv_cache_cpu["swa"],
+            swa_chunk_pages,
+        )
+        self._write_chunked_buffers(
+            self.c4_kv_pool.kv_buffer,
+            c4_page_indices,
+            kv_cache_cpu["c4"],
+            c4_chunk_pages,
+        )
+        self._write_chunked_buffers(
+            self.c128_kv_pool.kv_buffer,
+            full_page_indices,
+            kv_cache_cpu["c128"],
+            c128_chunk_pages,
+        )
+        self._write_chunked_buffers(
+            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            full_page_indices,
+            kv_cache_cpu["c4_indexer"],
+            indexer_chunk_pages,
+        )
+
+        state_chunk_rows = self.cpu_offloading_chunk_size
+        for layer_id, pool in enumerate(self.compress_state_pools):
+            saved_chunks = kv_cache_cpu["compress_state"][layer_id]
+            if pool is not None and saved_chunks is not None:
+                state_locs = self._state_locs_from_swa(pool, mapped_swa_locs)
+                self._write_chunked_rows(
+                    pool.kv_score_buffer.kv_score,
+                    state_locs,
+                    saved_chunks,
+                    state_chunk_rows,
+                )
+
+        for layer_id, pool in enumerate(self.indexer_compress_state_pools):
+            saved_chunks = kv_cache_cpu["indexer_compress_state"][layer_id]
+            if pool is not None and saved_chunks is not None:
+                state_locs = self._state_locs_from_swa(pool, mapped_swa_locs)
+                self._write_chunked_rows(
+                    pool.kv_score_buffer.kv_score,
+                    state_locs,
+                    saved_chunks,
+                    state_chunk_rows,
+                )
+        current_platform.synchronize()

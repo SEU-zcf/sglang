@@ -566,3 +566,35 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
+
+    def _compute_hisparse_c4_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map each logical full-KV page to its resident HiSparse c4 page."""
+        assert self.page_size == self.hisparse_page_size * self.compress_ratio
+        full_page_indices = torch.unique_consecutive(indices // self.page_size)
+        c4_logical_page_starts = full_page_indices * self.hisparse_page_size
+        hisparse_locs = self.full_to_hisparse_device_index_mapping[
+            c4_logical_page_starts
+        ]
+        assert bool(torch.all(hisparse_locs > 0).item()), (
+            "DeepSeek V4 HiSparse CPU retract offload requires every c4 page to "
+            "be resident on the device; offload with active HiSparse eviction "
+            "is not supported yet"
+        )
+        return hisparse_locs // self.hisparse_page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        c4_page_indices = self._compute_hisparse_c4_page_indices(indices)
+        return self._kvcache.get_cpu_copy(
+            indices,
+            mamba_indices=mamba_indices,
+            _c4_page_override=c4_page_indices,
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        c4_page_indices = self._compute_hisparse_c4_page_indices(indices)
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            _c4_page_override=c4_page_indices,
+        )
