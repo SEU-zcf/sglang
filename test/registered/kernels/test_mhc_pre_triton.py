@@ -54,7 +54,9 @@ def _reference(
         layer_input = (
             layer_input.float() * inv_layer_rms * norm_weight.bfloat16().float()
         ).bfloat16()
-    return post, comb, layer_input
+    # ``mhc_pre`` returns post with a trailing singleton dimension so it can be
+    # broadcast directly by ``hc_post``: [T, H, 1].
+    return post.unsqueeze(-1), comb, layer_input
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
