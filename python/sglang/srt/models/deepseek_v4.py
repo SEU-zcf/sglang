@@ -204,6 +204,7 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # tensor layout assumptions, so keep it disabled when either dependency is off.
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+        and not envs.SGLANG_OPT_USE_TRITON_MHC_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
     )
@@ -1421,7 +1422,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if (
+            envs.SGLANG_OPT_USE_TRITON_MHC_PRE.get()
+            or envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -2663,7 +2667,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._mhc_prewarmed_at_load = True
         if _is_npu or not (
             envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            and (
+                envs.SGLANG_OPT_USE_TRITON_MHC_PRE.get()
+                or envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            )
         ):
             return
         layer = next(

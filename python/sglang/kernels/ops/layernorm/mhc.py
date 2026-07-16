@@ -779,7 +779,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             T.pdl_trigger()
 
 
-def mhc_pre(
+def mhc_pre_tilelang(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -978,6 +978,60 @@ def mhc_pre(
     layer_input = layer_input.view(*outer_shape, hidden_size)
 
     return post_mix, comb_mix, layer_input
+
+
+def mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    n_splits_pre: int = 32,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch DSV4 mHC pre to the selected implementation."""
+
+    if envs.SGLANG_OPT_USE_TRITON_MHC_PRE.get():
+        from sglang.kernels.ops.layernorm.mhc_triton import mhc_pre_triton
+
+        return mhc_pre_triton(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            n_splits_pre,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+    return mhc_pre_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        n_splits_pre,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
 
 
 @tilelang.jit(
