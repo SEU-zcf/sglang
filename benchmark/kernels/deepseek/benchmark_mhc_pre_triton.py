@@ -9,6 +9,7 @@ Example on an H200:
 from __future__ import annotations
 
 import argparse
+import socket
 
 import torch
 import triton
@@ -91,6 +92,35 @@ def bench(fn, warmup: int, rep: int):
     return median * 1000.0, p20 * 1000.0, p80 * 1000.0
 
 
+def init_single_rank_model_parallel():
+    """Initialize the TP group required by the current TileLang baseline.
+
+    ``mhc_pre_tilelang`` allocates its output through the symmetric-memory
+    helper, which expects a tensor-parallel group even at TP=1. The benchmark
+    measures a single GPU, so this creates a one-rank NCCL group only; no
+    collective communication is performed by either implementation.
+    """
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    torch.cuda.set_device(0)
+    # Avoid assuming that a fixed TCP port is free on a shared benchmark host.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
+        backend="nccl",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[4096, 7168])
@@ -104,6 +134,7 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    init_single_rank_model_parallel()
     print(f"GPU: {torch.cuda.get_device_name()}")
     print("Times are median [p20, p80] in microseconds; speedup = TileLang/Triton.")
     print(
